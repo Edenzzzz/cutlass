@@ -457,6 +457,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         k_iter: cute.Pointer,
         v_iter: cute.Pointer,
         o_iter: cute.Pointer,
+        delta_s_iter: cute.Pointer | None,
         problem_size: Tuple[Int32, Int32, Int32, Int32, Int32, Int32],
         cum_seqlen_q: cute.Tensor | None,
         cum_seqlen_k: cute.Tensor | None,
@@ -533,12 +534,23 @@ class BlackwellFusedMultiHeadAttentionForward:
             stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo)),
         )
         o = cute.make_tensor(o_iter + qo_offset, o_layout)
+        
+        # Create delta_s tensor if provided
+        delta_s = None
+        if cutlass.const_expr(delta_s_iter is not None):
+            # (s_q, s_k, h_k, b) - same layout as attention scores
+            delta_s_layout = cute.make_layout(
+                (s_q, s_k, h_k, b),
+                stride=(s_k * h_k * b, h_k * b, b, 1),
+            )
+            delta_s = cute.make_tensor(delta_s_iter, delta_s_layout)
 
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = q.element_type
         self.k_dtype = k.element_type
         self.v_dtype = v.element_type
         self.o_dtype = o.element_type
+        self.delta_s_dtype = delta_s.element_type if delta_s is not None else None
 
         self.tile_sched_params, grid = self._compute_grid(
             cute.shape((s_q, d, ((h_r, h_k), b))),
@@ -625,6 +637,17 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.epi_tile,
             self.epi_stage,
         )
+        
+        # Create delta_s shared memory layout if delta_s is provided
+        delta_s_smem_layout_staged = None
+        if cutlass.const_expr(delta_s is not None):
+            # Use same layout as K for delta_s (same shape as attention scores)
+            delta_s_smem_layout_staged = sm100_utils.make_smem_layout_b(
+                qk_tiled_mma,
+                self.qk_mma_tiler,
+                Float32,  # delta_s is always Float32
+                self.kv_stage,
+            )
 
         # TMA load for Q
         tma_load_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(cta_group)
@@ -672,6 +695,20 @@ class BlackwellFusedMultiHeadAttentionForward:
             o_smem_layout,
             o_cta_v_layout,
         )
+        
+        # TMA load for delta_s if provided
+        tma_atom_delta_s = None
+        tma_tensor_delta_s = None
+        if cutlass.const_expr(delta_s is not None):
+            delta_s_smem_layout = cute.select(delta_s_smem_layout_staged, mode=[0, 1, 2])
+            tma_atom_delta_s, tma_tensor_delta_s = cute.nvgpu.make_tiled_tma_atom_B(
+                tma_load_op,
+                delta_s,
+                delta_s_smem_layout,
+                self.qk_mma_tiler,
+                qk_tiled_mma,
+                self.cluster_layout_vmnk.shape,
+            )
 
         q_copy_size = cute.size_in_bytes(self.q_dtype, q_smem_layout)
         k_copy_size = cute.size_in_bytes(self.k_dtype, k_smem_layout)
@@ -708,6 +745,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                 cute.struct.MemRange[self.k_dtype, cute.cosize(k_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
+            sDeltaS: cute.struct.Align[
+                cute.struct.MemRange[Float32, cute.cosize(delta_s_smem_layout_staged)],
+                self.buffer_align_bytes,
+            ] if cutlass.const_expr(delta_s is not None) else None
 
         self.shared_storage = SharedStorage
 
@@ -723,6 +764,8 @@ class BlackwellFusedMultiHeadAttentionForward:
             tma_tensor_v,
             tma_atom_o,
             tma_tensor_o,
+            tma_atom_delta_s,
+            tma_tensor_delta_s,
             cum_seqlen_q,
             cum_seqlen_k,
             scale_softmax_log2,
@@ -732,6 +775,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             p_tmem_layout_staged,
             v_smem_layout_staged,
             o_smem_layout_staged,
+            delta_s_smem_layout_staged,
             self.tile_sched_params,
         ).launch(
             grid=grid,
@@ -755,6 +799,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         mV_dkl: cute.Tensor,
         tma_atom_o: cute.CopyAtom,
         mO_qdl: cute.Tensor,
+        tma_atom_delta_s: cute.CopyAtom | None,
+        mDeltaS_dkl: cute.Tensor | None,
         cum_seqlen_q: cute.Tensor | None,
         cum_seqlen_k: cute.Tensor | None,
         scale_softmax_log2: Float32,
@@ -764,6 +810,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         p_tmem_layout_staged: cute.ComposedLayout,
         v_smem_layout_staged: cute.ComposedLayout,
         o_smem_layout_staged: cute.ComposedLayout,
+        delta_s_smem_layout_staged: cute.ComposedLayout | None,
         tile_sched_params: FmhaStaticTileSchedulerParams,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
@@ -829,6 +876,8 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_k)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_v)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_o)
+            if cutlass.const_expr(tma_atom_delta_s is not None):
+                cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_delta_s)
 
         # Alloc
         smem = utils.SmemAllocator()
@@ -947,6 +996,13 @@ class BlackwellFusedMultiHeadAttentionForward:
         sO = storage.sO.get_tensor(
             o_smem_layout_staged.outer, swizzle=o_smem_layout_staged.inner
         )
+        
+        # Create delta_s shared memory tensor if provided
+        sDeltaS = None
+        if cutlass.const_expr(delta_s_smem_layout_staged is not None):
+            sDeltaS = storage.sDeltaS.get_tensor(
+                delta_s_smem_layout_staged.outer, swizzle=delta_s_smem_layout_staged.inner
+            )
         qk_thr_mma = qk_tiled_mma.get_slice(0)  # default 1sm
         pv_thr_mma = pv_tiled_mma.get_slice(0)  # default 1sm
         tSrQ = qk_thr_mma.make_fragment_A(sQ)
@@ -1097,6 +1153,24 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cute.group_modes(tSgV_dkl, 0, 3),
                     )
                     tVgV = tVgV_dkl[None, 0, None, curr_block_coord_kv[2]]
+                    
+                    # Delta_s loading if provided
+                    tSgDeltaS_dkl = None
+                    tDeltaSgDeltaS_dkl = None
+                    tDeltaSgDeltaS = None
+                    if cutlass.const_expr(tma_atom_delta_s is not None):
+                        gDeltaS_dkl = cute.flat_divide(
+                            mDeltaS_dkl, cute.select(self.qk_mma_tiler, mode=[1, 2])
+                        )
+                        tSgDeltaS_dkl = qk_thr_mma.partition_B(gDeltaS_dkl)
+                        tDeltaSsDeltaS, tDeltaSgDeltaS_dkl = cute.nvgpu.cpasync.tma_partition(
+                            tma_atom_delta_s,
+                            0,  # no multicast
+                            cute.make_layout(1),
+                            cute.group_modes(sDeltaS, 0, 3),
+                            cute.group_modes(tSgDeltaS_dkl, 0, 3),
+                        )
+                        tDeltaSgDeltaS = tDeltaSgDeltaS_dkl[None, None, 0, curr_block_coord_kv[2]]
 
                     # Q0
                     q0_coord = 2 * curr_block_coord_q[0]
@@ -1133,6 +1207,17 @@ class BlackwellFusedMultiHeadAttentionForward:
                         tVsV[None, v_handle.index],
                         tma_bar_ptr=v_handle.barrier,
                     )
+                    
+                    # Delta_s0 if provided
+                    if cutlass.const_expr(tma_atom_delta_s is not None):
+                        delta_s_handle = load_kv_producer.acquire_and_advance()
+                        cute.copy(
+                            tma_atom_delta_s,
+                            tDeltaSgDeltaS[None, kv_coord],
+                            tDeltaSsDeltaS[None, delta_s_handle.index],
+                            tma_bar_ptr=delta_s_handle.barrier,
+                        )
+                    
                     kv_coord += 1
 
                     seqlen_kv_loop_steps = (
@@ -1156,6 +1241,17 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tVsV[None, v_handle.index],
                             tma_bar_ptr=v_handle.barrier,
                         )
+                        
+                        # Delta_si if provided
+                        if cutlass.const_expr(tma_atom_delta_s is not None):
+                            delta_s_handle = load_kv_producer.acquire_and_advance()
+                            cute.copy(
+                                tma_atom_delta_s,
+                                tDeltaSgDeltaS[None, kv_coord],
+                                tDeltaSsDeltaS[None, delta_s_handle.index],
+                                tma_bar_ptr=delta_s_handle.barrier,
+                            )
+                        
                         kv_coord += 1
                     # End of seqlen_kv loop
 
@@ -1223,6 +1319,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tSrK0[kphase_coord_0],
                             tStS0,
                         )
+                    # 5. Add delta_s smoothing factors if provided
+                    if cutlass.const_expr(sDeltaS is not None):
+                        self.add_delta_s(tStS0, sDeltaS, 0)
                     # 5. release S0
                     s0_handle.commit()
                     # End of GEMM (Q0 * K0 -> S0)
@@ -1245,7 +1344,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tSrK0[kphase_coord_1],
                             tStS1,
                         )
-                    # 4. release S1
+                    # 4. Add delta_s smoothing factors if provided
+                    if cutlass.const_expr(sDeltaS is not None):
+                        self.add_delta_s(tStS1, sDeltaS, 1)
+                    # 5. release S1
                     s1_handle.commit()
                     # 5. release K0
                     k_handle.release()
@@ -1307,7 +1409,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 tSrKi[kphase_coord_3],
                                 tStS0,
                             )
-                        # 3. release S0
+                        # 3. Add delta_s smoothing factors if provided
+                        if cutlass.const_expr(sDeltaS is not None):
+                            self.add_delta_s(tStS0, sDeltaS, 0)
+                        # 4. release S0
                         s0_handle.commit()
                         # End of GEMM_QK0i (Q0 * Ki -> S0)
 
@@ -1352,6 +1457,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 tSrKi[kphase_coord_5],
                                 tStS1,
                             )
+                        # 2. Add delta_s smoothing factors if provided
+                        if cutlass.const_expr(sDeltaS is not None):
+                            self.add_delta_s(tStS1, sDeltaS, 1)
                         s1_handle.commit()
                         # 2. release Ki
                         k_handle.release()
@@ -1923,6 +2031,50 @@ class BlackwellFusedMultiHeadAttentionForward:
             s0_s1_sequence_consumer,
             s0_s1_sequence_producer,
         )
+
+    @cute.jit
+    def add_delta_s(self, acc: cute.Tensor, sDeltaS: cute.Tensor, stage: int):
+        """Add delta_s smoothing factors (computed from avg pooled qkv attn) to attention accumulator.
+        
+        This function implements the delta_s addition similar to SageAttention:
+        1. Load delta_s values from shared memory
+        2. Recast accumulator to float4 for efficient processing
+        3. Add delta_s values to accumulator using quad-based indexing
+        
+        :param acc: Attention accumulator tensor to modify
+        :type acc: cute.Tensor
+        :param sDeltaS: Shared memory tensor containing delta_s values
+        :type sDeltaS: cute.Tensor
+        :param stage: Processing stage (0 or 1)
+        :type stage: int
+        """
+        if cutlass.const_expr(sDeltaS is None):
+            return
+            
+        # Get thread index for quad-based processing
+        tidx, _, _ = cute.arch.thread_idx()
+        quad_id = (tidx % 4) * 2
+        
+        # Recast accumulator to float4 for efficient processing
+        acc_float4 = cute.recast(acc, Float32)
+        
+        # Get delta_s values for current stage
+        sDeltaS_stage = sDeltaS[None, None, stage]
+        
+        # Process in groups of 4 float4 values
+        for i in cutlass.range(0, 4, unroll=True):
+            num = quad_id + i * 8
+            
+            # Load delta_s values for current quad
+            delta_s_0 = sDeltaS_stage[0, num]
+            delta_s_1 = sDeltaS_stage[0, num + 1]
+            
+            # Add delta_s to accumulator using quad-based indexing
+            # This follows the SageAttention pattern for efficient memory access
+            acc_float4[0, 0, i] += delta_s_0
+            acc_float4[0, 1, i] += delta_s_0
+            acc_float4[1, 0, i] += delta_s_1
+            acc_float4[1, 1, i] += delta_s_1
 
     @cute.jit
     def quantize_fp4(self, tTMEM_STORErS_x4, tTMEM_STORErS_x4_e, tStS_SF, stage):
@@ -2546,6 +2698,7 @@ def run(
     iterations: int,
     skip_ref_check: bool,
     use_cold_l2: bool = False,
+    delta_s_tensor: torch.Tensor | None = None,
     **kwargs,
 ):
     """Execute Fused Multi-Head Attention (FMHA) on Blackwell architecture and validate results.
@@ -2795,6 +2948,12 @@ def run(
         s_cumsum=cum_seqlen_q_torch,
         is_dynamic_layout=True,
     )
+    
+    # Create delta_s tensor if provided
+    delta_s_tensor_cute = None
+    if delta_s_tensor is not None:
+        delta_s_tensor_cute = from_dlpack(delta_s_tensor, assumed_align=16)
+        delta_s_tensor_cute.element_type = Float32
 
     mma_tiler = (*mma_tiler_mn, d)
 
@@ -2849,6 +3008,7 @@ def run(
         k_tensor.iterator,
         v_tensor.iterator,
         o_tensor.iterator,
+        delta_s_tensor_cute.iterator if delta_s_tensor_cute is not None else None,
         problem_size,
         cum_seqlen_q,
         cum_seqlen_k,
@@ -2919,6 +3079,7 @@ def run(
             k_tensor.iterator,
             v_tensor.iterator,
             o_tensor.iterator,
+            delta_s_tensor_cute.iterator if delta_s_tensor_cute is not None else None,
             problem_size,
             cum_seqlen_q,
             cum_seqlen_k,
@@ -3012,6 +3173,7 @@ def run(
             k_tensor_workspace.iterator,
             v_tensor_workspace.iterator,
             o_tensor_workspace.iterator,
+            delta_s_tensor_cute.iterator if delta_s_tensor_cute is not None else None,
             problem_size,
             cum_seqlen_q,
             cum_seqlen_k,
@@ -3222,6 +3384,13 @@ if __name__ == "__main__":
         default=False,
         help="Use circular buffer tensor sets to ensure L2 cold cache",
     )
+    
+    parser.add_argument(
+        "--delta_s_tensor",
+        type=str,
+        default=None,
+        help="Path to delta_s tensor file (optional). Shape should be (seqlen_q, seqlen_k, heads_k, batch)",
+    )
 
     args = parser.parse_args()
 
@@ -3238,6 +3407,12 @@ if __name__ == "__main__":
         raise RuntimeError("GPU is required to run this example!")
 
     torch.manual_seed(1111)
+    
+    # Load delta_s tensor if provided
+    delta_s_tensor = None
+    if args.delta_s_tensor is not None:
+        delta_s_tensor = torch.load(args.delta_s_tensor, map_location='cuda')
+        print(f"Loaded delta_s tensor with shape: {delta_s_tensor.shape}")
 
     run(
         args.q_shape,
@@ -3259,6 +3434,7 @@ if __name__ == "__main__":
         args.iterations,
         args.skip_ref_check,
         args.use_cold_l2,
+        delta_s_tensor,
     )
 
     print("PASS")

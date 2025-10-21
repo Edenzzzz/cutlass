@@ -52,7 +52,7 @@ struct SoftmaxFused{
             fill(scores_scale, 1.f);
 
             CUTLASS_PRAGMA_UNROLL
-            for (int mi = 0; mi < size<0>(acc_reduction_view); mi++) {
+            for (int mi = 0; mi < size<0>(acc_reduction_view); mi++) { // iterates over AtomM × MmaM using 1D index
                 CUTLASS_PRAGMA_UNROLL
                 for (int ni = 0; ni < size<1, 1>(acc_reduction_view); ni++) {
                     CUTLASS_PRAGMA_UNROLL
