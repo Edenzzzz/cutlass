@@ -664,50 +664,33 @@ class BlackwellFusedMultiHeadAttentionForward:
         sfv_smem_layout_staged = None
         
         if cutlass.const_expr(sfq is not None):
-            # SFQ uses deduce_smem_layoutSFQ from BlkScaledConfig
-            # Scale factors are much smaller than QKV - use actual MMA tile dimensions
-            # Based on blockscaled_layout.h: 1 scale factor per 16 elements (Blk_MN/Blk_SF = 64/4 = 16)
-            sfq_m_blocks = self.qk_mma_tiler[0] // 16  # M divided by scale factor block size
-            sfq_k_blocks = self.qk_mma_tiler[2] // 16  # K divided by scale factor block size
-            sfq_smem_layout_atom = cute.make_layout(
-                (sfq_m_blocks, sfq_k_blocks),  # Much smaller than QKV
-                (0, 1)  # stride (0, 1) - row-major
+            # SFQ uses blockscaled_utils.make_smem_layout_sfa
+            # This handles the proper scale factor layout based on MMA tile dimensions
+            sfq_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
+                self.qk_tiled_mma,
+                self.qk_mma_tiler,
+                self.sf_vec_size,
+                self.q_stage,  # Q doesn't use staging, but pass for consistency
             )
-            # SFQ doesn't use staging - it's loaded once per Q tile
-            sfq_smem_layout_staged = sfq_smem_layout_atom
             
         if cutlass.const_expr(sfk is not None):
-            # SFK uses deduce_smem_layoutSFKV from BlkScaledConfig
-            # Scale factors are much smaller than QKV - use actual MMA tile dimensions
-            # Based on blockscaled_layout.h: 1 scale factor per 16 elements (Blk_MN/Blk_SF = 64/4 = 16)
-            sfk_n_blocks = self.qk_mma_tiler[1] // 16  # N divided by scale factor block size
-            sfk_k_blocks = self.qk_mma_tiler[2] // 16  # K divided by scale factor block size
-            sfk_smem_layout_atom = cute.make_layout(
-                (sfk_n_blocks, sfk_k_blocks),  # Much smaller than QKV
-                (0, 1)  # stride (0, 1) - row-major
-            )
-            # SFK uses staging for pipeline
-            sfk_smem_layout_staged = cute.tile_to_shape(
-                sfk_smem_layout_atom,
-                (sfk_n_blocks, sfk_k_blocks, self.kv_stage),
-                (1, 2)  # step (1, 2) for staging
+            # SFK uses blockscaled_utils.make_smem_layout_sfb
+            # This handles the proper scale factor layout based on MMA tile dimensions
+            sfk_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(
+                self.qk_tiled_mma,
+                self.qk_mma_tiler,
+                self.sf_vec_size,
+                self.kv_stage,  # K uses staging for pipeline
             )
             
         if cutlass.const_expr(sfv is not None):
-            # SFV uses deduce_smem_layoutSFKV from BlkScaledConfig
-            # Scale factors are much smaller than QKV - use actual MMA tile dimensions
-            # Based on blockscaled_layout.h: 1 scale factor per 16 elements (Blk_MN/Blk_SF = 64/4 = 16)
-            sfv_n_blocks = self.pv_mma_tiler[1] // 16  # N divided by scale factor block size
-            sfv_k_blocks = self.pv_mma_tiler[2] // 16  # K divided by scale factor block size
-            sfv_smem_layout_atom = cute.make_layout(
-                (sfv_n_blocks, sfv_k_blocks),  # Much smaller than QKV
-                (0, 1)  # stride (0, 1) - row-major
-            )
-            # SFV uses staging for pipeline
-            sfv_smem_layout_staged = cute.tile_to_shape(
-                sfv_smem_layout_atom,
-                (sfv_n_blocks, sfv_k_blocks, self.kv_stage),
-                (1, 2)  # step (1, 2) for staging
+            # SFV uses blockscaled_utils.make_smem_layout_sfb
+            # This handles the proper scale factor layout based on MMA tile dimensions
+            sfv_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(
+                self.pv_tiled_mma,
+                self.pv_mma_tiler,
+                self.sf_vec_size,
+                self.kv_stage,  # V uses staging for pipeline
             )
 
         # TMA load for Q
