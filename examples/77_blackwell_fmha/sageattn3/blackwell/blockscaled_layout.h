@@ -59,7 +59,7 @@ template<int SFVecSize_>
 struct BlockScaledConfig {
   // We are creating the SFA and SFB tensors' layouts in the collective since they always have the same layout.
   // k-major order
-  static constexpr int SFVecSize = SFVecSize_;
+  static constexpr int SFVecSize = SFVecSize_; // 16
   static constexpr int MMA_NSF = 4; // SFVecSize, MMA_NSF
   using BlkScaledChunk = BlockScaledBasicChunk<SFVecSize>;
   using Blk_MN    = _64;

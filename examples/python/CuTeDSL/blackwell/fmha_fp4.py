@@ -641,12 +641,73 @@ class BlackwellFusedMultiHeadAttentionForward:
         # Create delta_s shared memory layout if delta_s is provided
         delta_s_smem_layout_staged = None
         if cutlass.const_expr(delta_s is not None):
-            # Use same layout as K for delta_s (same shape as attention scores)
-            delta_s_smem_layout_staged = sm100_utils.make_smem_layout_b(
-                qk_tiled_mma,
-                self.qk_mma_tiler,
-                Float32,  # delta_s is always Float32
-                self.kv_stage,
+            # Delta_s uses the same layout pattern as SageAttention:
+            # SmemLayoutAtomDS = Layout<Shape<kBlockM, kBlockN>, Stride<_0, _1>>
+            # SmemLayoutDS = tile_to_shape(SmemLayoutAtomDS, (TileShape_MNK[0], TileShape_MNK[1], kStages))
+            delta_s_smem_layout_atom = cute.make_layout(
+                (self.qk_mma_tiler[0], self.qk_mma_tiler[1]),  # (kBlockM, kBlockN)
+                (0, 1)  # Stride<_0, _1> - row-major within blocks
+            )
+            # Tile to stages for pipeline - matches SageAttention pattern
+            delta_s_smem_layout_staged = cute.tile_to_shape(
+                delta_s_smem_layout_atom,
+                (self.qk_mma_tiler[0], self.qk_mma_tiler[1], self.kv_stage),
+                (1, 2)  # step (1, 2) for staging
+            )
+
+        # Create scale factor shared memory layouts if scale factors are provided
+        # Scale factors use specialized block-scaled layouts from BlkScaledConfig
+        # Key insight: Scale factors are much smaller than QKV - 1 scale factor per 16 elements
+        # Blk_SF = 4, Blk_MN = 64, so 1 scale factor per 16 elements (64/4 = 16)
+        sfq_smem_layout_staged = None
+        sfk_smem_layout_staged = None
+        sfv_smem_layout_staged = None
+        
+        if cutlass.const_expr(sfq is not None):
+            # SFQ uses deduce_smem_layoutSFQ from BlkScaledConfig
+            # Scale factors are much smaller than QKV - use actual MMA tile dimensions
+            # Based on blockscaled_layout.h: 1 scale factor per 16 elements (Blk_MN/Blk_SF = 64/4 = 16)
+            sfq_m_blocks = self.qk_mma_tiler[0] // 16  # M divided by scale factor block size
+            sfq_k_blocks = self.qk_mma_tiler[2] // 16  # K divided by scale factor block size
+            sfq_smem_layout_atom = cute.make_layout(
+                (sfq_m_blocks, sfq_k_blocks),  # Much smaller than QKV
+                (0, 1)  # stride (0, 1) - row-major
+            )
+            # SFQ doesn't use staging - it's loaded once per Q tile
+            sfq_smem_layout_staged = sfq_smem_layout_atom
+            
+        if cutlass.const_expr(sfk is not None):
+            # SFK uses deduce_smem_layoutSFKV from BlkScaledConfig
+            # Scale factors are much smaller than QKV - use actual MMA tile dimensions
+            # Based on blockscaled_layout.h: 1 scale factor per 16 elements (Blk_MN/Blk_SF = 64/4 = 16)
+            sfk_n_blocks = self.qk_mma_tiler[1] // 16  # N divided by scale factor block size
+            sfk_k_blocks = self.qk_mma_tiler[2] // 16  # K divided by scale factor block size
+            sfk_smem_layout_atom = cute.make_layout(
+                (sfk_n_blocks, sfk_k_blocks),  # Much smaller than QKV
+                (0, 1)  # stride (0, 1) - row-major
+            )
+            # SFK uses staging for pipeline
+            sfk_smem_layout_staged = cute.tile_to_shape(
+                sfk_smem_layout_atom,
+                (sfk_n_blocks, sfk_k_blocks, self.kv_stage),
+                (1, 2)  # step (1, 2) for staging
+            )
+            
+        if cutlass.const_expr(sfv is not None):
+            # SFV uses deduce_smem_layoutSFKV from BlkScaledConfig
+            # Scale factors are much smaller than QKV - use actual MMA tile dimensions
+            # Based on blockscaled_layout.h: 1 scale factor per 16 elements (Blk_MN/Blk_SF = 64/4 = 16)
+            sfv_n_blocks = self.pv_mma_tiler[1] // 16  # N divided by scale factor block size
+            sfv_k_blocks = self.pv_mma_tiler[2] // 16  # K divided by scale factor block size
+            sfv_smem_layout_atom = cute.make_layout(
+                (sfv_n_blocks, sfv_k_blocks),  # Much smaller than QKV
+                (0, 1)  # stride (0, 1) - row-major
+            )
+            # SFV uses staging for pipeline
+            sfv_smem_layout_staged = cute.tile_to_shape(
+                sfv_smem_layout_atom,
+                (sfv_n_blocks, sfv_k_blocks, self.kv_stage),
+                (1, 2)  # step (1, 2) for staging
             )
 
         # TMA load for Q
@@ -701,13 +762,56 @@ class BlackwellFusedMultiHeadAttentionForward:
         tma_tensor_delta_s = None
         if cutlass.const_expr(delta_s is not None):
             delta_s_smem_layout = cute.select(delta_s_smem_layout_staged, mode=[0, 1, 2])
-            tma_atom_delta_s, tma_tensor_delta_s = cute.nvgpu.make_tiled_tma_atom_B(
+            # Delta_s uses a simple TMA copy, not the complex B layout
+            tma_atom_delta_s, tma_tensor_delta_s = cute.nvgpu.cpasync.make_tiled_tma_atom(
                 tma_load_op,
                 delta_s,
                 delta_s_smem_layout,
-                self.qk_mma_tiler,
-                qk_tiled_mma,
-                self.cluster_layout_vmnk.shape,
+                cute.make_layout((self.qk_mma_tiler[0], self.qk_mma_tiler[1])),  # CTA layout
+            )
+
+        # TMA load for scale factors if provided
+        tma_atom_sfq = None
+        tma_tensor_sfq = None
+        tma_atom_sfk = None
+        tma_tensor_sfk = None
+        tma_atom_sfv = None
+        tma_tensor_sfv = None
+        
+        if cutlass.const_expr(sfq is not None):
+            # SFQ TMA - uses specialized scale factor TMA like SageAttention
+            sfq_smem_layout = cute.select(sfq_smem_layout_staged, mode=[0, 1])
+            sfq_m_blocks = self.qk_mma_tiler[0] // 16  # M divided by scale factor block size
+            sfq_k_blocks = self.qk_mma_tiler[2] // 16  # K divided by scale factor block size
+            tma_atom_sfq, tma_tensor_sfq = cute.nvgpu.cpasync.make_tiled_tma_atom(
+                tma_load_op,
+                sfq,
+                sfq_smem_layout,
+                cute.make_layout((sfq_m_blocks, sfq_k_blocks)),  # CTA layout (M/16, K/16)
+            )
+            
+        if cutlass.const_expr(sfk is not None):
+            # SFK TMA - uses specialized scale factor TMA like SageAttention
+            sfk_smem_layout = cute.select(sfk_smem_layout_staged, mode=[0, 1, 2])
+            sfk_n_blocks = self.qk_mma_tiler[1] // 16  # N divided by scale factor block size
+            sfk_k_blocks = self.qk_mma_tiler[2] // 16  # K divided by scale factor block size
+            tma_atom_sfk, tma_tensor_sfk = cute.nvgpu.cpasync.make_tiled_tma_atom(
+                tma_load_op,
+                sfk,
+                sfk_smem_layout,
+                cute.make_layout((sfk_n_blocks, sfk_k_blocks)),  # CTA layout (N/16, K/16)
+            )
+            
+        if cutlass.const_expr(sfv is not None):
+            # SFV TMA - uses specialized scale factor TMA like SageAttention
+            sfv_smem_layout = cute.select(sfv_smem_layout_staged, mode=[0, 1, 2])
+            sfv_n_blocks = self.pv_mma_tiler[1] // 16  # N divided by scale factor block size
+            sfv_k_blocks = self.pv_mma_tiler[2] // 16  # K divided by scale factor block size
+            tma_atom_sfv, tma_tensor_sfv = cute.nvgpu.cpasync.make_tiled_tma_atom(
+                tma_load_op,
+                sfv,
+                sfv_smem_layout,
+                cute.make_layout((sfv_n_blocks, sfv_k_blocks)),  # CTA layout (N/16, K/16)
             )
 
         q_copy_size = cute.size_in_bytes(self.q_dtype, q_smem_layout)
@@ -749,6 +853,18 @@ class BlackwellFusedMultiHeadAttentionForward:
                 cute.struct.MemRange[Float32, cute.cosize(delta_s_smem_layout_staged)],
                 self.buffer_align_bytes,
             ] if cutlass.const_expr(delta_s is not None) else None
+            sSFQ: cute.struct.Align[
+                cute.struct.MemRange[Float16, cute.cosize(sfq_smem_layout_staged)],
+                self.buffer_align_bytes,
+            ] if cutlass.const_expr(sfq is not None) else None
+            sSFK: cute.struct.Align[
+                cute.struct.MemRange[Float16, cute.cosize(sfk_smem_layout_staged)],
+                self.buffer_align_bytes,
+            ] if cutlass.const_expr(sfk is not None) else None
+            sSFV: cute.struct.Align[
+                cute.struct.MemRange[Float16, cute.cosize(sfv_smem_layout_staged)],
+                self.buffer_align_bytes,
+            ] if cutlass.const_expr(sfv is not None) else None
 
         self.shared_storage = SharedStorage
 
@@ -766,6 +882,12 @@ class BlackwellFusedMultiHeadAttentionForward:
             tma_tensor_o,
             tma_atom_delta_s,
             tma_tensor_delta_s,
+            tma_atom_sfq,
+            tma_tensor_sfq,
+            tma_atom_sfk,
+            tma_tensor_sfk,
+            tma_atom_sfv,
+            tma_tensor_sfv,
             cum_seqlen_q,
             cum_seqlen_k,
             scale_softmax_log2,
@@ -776,6 +898,9 @@ class BlackwellFusedMultiHeadAttentionForward:
             v_smem_layout_staged,
             o_smem_layout_staged,
             delta_s_smem_layout_staged,
+            sfq_smem_layout_staged,
+            sfk_smem_layout_staged,
+            sfv_smem_layout_staged,
             self.tile_sched_params,
         ).launch(
             grid=grid,
@@ -801,6 +926,12 @@ class BlackwellFusedMultiHeadAttentionForward:
         mO_qdl: cute.Tensor,
         tma_atom_delta_s: cute.CopyAtom | None,
         mDeltaS_dkl: cute.Tensor | None,
+        tma_atom_sfq: cute.CopyAtom | None,
+        mSFQ_qdl: cute.Tensor | None,
+        tma_atom_sfk: cute.CopyAtom | None,
+        mSFK_kdl: cute.Tensor | None,
+        tma_atom_sfv: cute.CopyAtom | None,
+        mSFV_dkl: cute.Tensor | None,
         cum_seqlen_q: cute.Tensor | None,
         cum_seqlen_k: cute.Tensor | None,
         scale_softmax_log2: Float32,
@@ -811,6 +942,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         v_smem_layout_staged: cute.ComposedLayout,
         o_smem_layout_staged: cute.ComposedLayout,
         delta_s_smem_layout_staged: cute.ComposedLayout | None,
+        sfq_smem_layout_staged: cute.ComposedLayout | None,
+        sfk_smem_layout_staged: cute.ComposedLayout | None,
+        sfv_smem_layout_staged: cute.ComposedLayout | None,
         tile_sched_params: FmhaStaticTileSchedulerParams,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
@@ -1003,6 +1137,23 @@ class BlackwellFusedMultiHeadAttentionForward:
             sDeltaS = storage.sDeltaS.get_tensor(
                 delta_s_smem_layout_staged.outer, swizzle=delta_s_smem_layout_staged.inner
             )
+            
+        # Create scale factor shared memory tensors if provided
+        sSFQ = None
+        sSFK = None
+        sSFV = None
+        if cutlass.const_expr(sfq_smem_layout_staged is not None):
+            sSFQ = storage.sSFQ.get_tensor(
+                sfq_smem_layout_staged.outer, swizzle=sfq_smem_layout_staged.inner
+            )
+        if cutlass.const_expr(sfk_smem_layout_staged is not None):
+            sSFK = storage.sSFK.get_tensor(
+                sfk_smem_layout_staged.outer, swizzle=sfk_smem_layout_staged.inner
+            )
+        if cutlass.const_expr(sfv_smem_layout_staged is not None):
+            sSFV = storage.sSFV.get_tensor(
+                sfv_smem_layout_staged.outer, swizzle=sfv_smem_layout_staged.inner
+            )
         qk_thr_mma = qk_tiled_mma.get_slice(0)  # default 1sm
         pv_thr_mma = pv_tiled_mma.get_slice(0)  # default 1sm
         tSrQ = qk_thr_mma.make_fragment_A(sQ)
@@ -1155,22 +1306,17 @@ class BlackwellFusedMultiHeadAttentionForward:
                     tVgV = tVgV_dkl[None, 0, None, curr_block_coord_kv[2]]
                     
                     # Delta_s loading if provided
-                    tSgDeltaS_dkl = None
-                    tDeltaSgDeltaS_dkl = None
+                    tDeltaSsDeltaS = None
                     tDeltaSgDeltaS = None
                     if cutlass.const_expr(tma_atom_delta_s is not None):
-                        gDeltaS_dkl = cute.flat_divide(
-                            mDeltaS_dkl, cute.select(self.qk_mma_tiler, mode=[1, 2])
-                        )
-                        tSgDeltaS_dkl = qk_thr_mma.partition_B(gDeltaS_dkl)
-                        tDeltaSsDeltaS, tDeltaSgDeltaS_dkl = cute.nvgpu.cpasync.tma_partition(
+                        # Delta_s uses simple partitioning, not the complex B layout
+                        tDeltaSsDeltaS, tDeltaSgDeltaS = cute.nvgpu.cpasync.tma_partition(
                             tma_atom_delta_s,
                             0,  # no multicast
                             cute.make_layout(1),
-                            cute.group_modes(sDeltaS, 0, 3),
-                            cute.group_modes(tSgDeltaS_dkl, 0, 3),
+                            cute.group_modes(sDeltaS, 0, 2),  # Only 2 modes for simple layout
+                            cute.group_modes(mDeltaS_dkl, 0, 2),
                         )
-                        tDeltaSgDeltaS = tDeltaSgDeltaS_dkl[None, None, 0, curr_block_coord_kv[2]]
 
                     # Q0
                     q0_coord = 2 * curr_block_coord_q[0]
@@ -2036,10 +2182,10 @@ class BlackwellFusedMultiHeadAttentionForward:
     def add_delta_s(self, acc: cute.Tensor, sDeltaS: cute.Tensor, stage: int):
         """Add delta_s smoothing factors (computed from avg pooled qkv attn) to attention accumulator.
         
-        This function implements the delta_s addition similar to SageAttention:
-        1. Load delta_s values from shared memory
-        2. Recast accumulator to float4 for efficient processing
-        3. Add delta_s values to accumulator using quad-based indexing
+        This function implements the delta_s addition exactly like SageAttention:
+        1. Recast delta_s to float4 for efficient processing
+        2. Use quad-based indexing with thread coordination
+        3. Apply delta_s values using complex coordinate indexing
         
         :param acc: Attention accumulator tensor to modify
         :type acc: cute.Tensor
@@ -2051,26 +2197,28 @@ class BlackwellFusedMultiHeadAttentionForward:
         if cutlass.const_expr(sDeltaS is None):
             return
             
-        # Get thread index for quad-based processing
+        # Get thread index for quad-based processing (matches SageAttention)
         tidx, _, _ = cute.arch.thread_idx()
         quad_id = (tidx % 4) * 2
+        
+        # Recast delta_s to float4 for efficient processing (matches SageAttention)
+        sDeltaS_stage = sDeltaS[None, None, stage]
+        tSsDS_stage = cute.recast(sDeltaS_stage, Float32)
         
         # Recast accumulator to float4 for efficient processing
         acc_float4 = cute.recast(acc, Float32)
         
-        # Get delta_s values for current stage
-        sDeltaS_stage = sDeltaS[None, None, stage]
-        
-        # Process in groups of 4 float4 values
+        # Process in groups of 4 float4 values (matches SageAttention pattern)
         for i in cutlass.range(0, 4, unroll=True):
             num = quad_id + i * 8
             
-            # Load delta_s values for current quad
-            delta_s_0 = sDeltaS_stage[0, num]
-            delta_s_1 = sDeltaS_stage[0, num + 1]
+            # Load delta_s values for current quad using coordinate indexing
+            # This matches the SageAttention pattern exactly
+            delta_s_0 = tSsDS_stage[0, num]
+            delta_s_1 = tSsDS_stage[0, num + 1]
             
-            # Add delta_s to accumulator using quad-based indexing
-            # This follows the SageAttention pattern for efficient memory access
+            # Apply delta_s to accumulator using quad-based indexing
+            # This follows the exact SageAttention coordinate pattern
             acc_float4[0, 0, i] += delta_s_0
             acc_float4[0, 1, i] += delta_s_0
             acc_float4[1, 0, i] += delta_s_1

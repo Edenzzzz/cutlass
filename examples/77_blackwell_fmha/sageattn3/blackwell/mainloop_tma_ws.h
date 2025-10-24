@@ -223,7 +223,7 @@ struct CollectiveMainloopFwd {
         auto [Seqlen_Q, Seqlen_K, HeadNum, Batch] = args.shape_ds;
         LayoutDS layout_ds = tile_to_shape(SmemLayoutAtomDS{}, make_shape(Seqlen_Q, Seqlen_K, HeadNum, Batch), Step<_2,_1,_3,_4>{});
         Tensor mDS = make_tensor(make_gmem_ptr(args.ptr_ds), layout_ds);
-        TMA_DS tma_load_ds = make_tma_copy (
+        TMA_DS tma_load_ds = make_tma_copy(
             GmemTiledCopy{},
             mDS,
             SmemLayoutDS{}(_, _, _0{}),
@@ -622,7 +622,7 @@ struct CollectiveMainloopFwd {
         auto smem_tiled_copy_Q = make_tiled_copy_A(SmemCopyAtomQ{}, tiled_mma_qk);
         auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(thread_idx);
         Tensor tSsQ = smem_thr_copy_Q.partition_S(as_position_independent_swizzle_tensor(sQ));
-        Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+        Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ); // (m, k) -> value to (thr, ) -> value
 
         auto smem_tiled_copy_K = make_tiled_copy_B(SmemCopyAtomKV{}, tiled_mma_qk);
         auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(thread_idx);
