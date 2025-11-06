@@ -608,7 +608,7 @@ struct CollectiveMainloopFwd {
         auto thread_mma_qk = tiled_mma_qk.get_thread_slice(thread_idx);
         auto thread_mma_pv = tiled_mma_pv.get_thread_slice(thread_idx);
 
-        Tensor tSrQ = thread_mma_qk.partition_fragment_A(sQ);
+        Tensor tSrQ = thread_mma_qk.partition_fragment_A(sQ); // allocate registers
         Tensor tSrK = thread_mma_qk.partition_fragment_B(sK(_,_,Int<0>{}));
         Tensor tOrVt = thread_mma_pv.partition_fragment_B(sVt(_,_,Int<0>{})); // tOr = Thread-Scoped Output Register
         Tensor tOrP = make_tensor_like<Element>(LayoutP{}); // tSr = Thread-Scoped Register

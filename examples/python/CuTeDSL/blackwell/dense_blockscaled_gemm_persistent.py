@@ -300,7 +300,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cute.make_layout((*self.cluster_shape_mn, 1)),
             (tiled_mma_sfb.thr_id.shape,),
         )
-
+        breakpoint()
         # Compute number of multicast CTAs for A/B
         self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2])
         self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1])
@@ -923,7 +923,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # Partition shared/tensor memory tensor for TiledMMA_A/B/C
         #
         # (MMA, MMA_M, MMA_K, STAGE)
-        tCrA = tiled_mma.make_fragment_A(sA)
+        tCrA = tiled_mma.make_fragment_A(sA) # contains descriptor (including pointer to smem)
         # (MMA, MMA_N, MMA_K, STAGE)
         tCrB = tiled_mma.make_fragment_B(sB)
         # (MMA, MMA_M, MMA_N)
