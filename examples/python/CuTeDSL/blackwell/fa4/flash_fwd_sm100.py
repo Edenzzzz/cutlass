@@ -562,7 +562,6 @@ class FlashAttentionForwardSm100:
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         self.tile_scheduler_cls = TileScheduler
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
-
         self.mbar_load_q_full_offset = 0
         self.mbar_load_q_empty_offset = self.mbar_load_q_full_offset + self.q_stage
         self.mbar_load_kv_full_offset = self.mbar_load_q_empty_offset + self.q_stage

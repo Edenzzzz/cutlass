@@ -1,0 +1,20 @@
+Metadata-Version: 2.4
+Name: flash-attn-cute
+Version: 0.1.0
+Summary: Flash Attention CUTE (CUDA Template Engine) implementation
+Author: Tri Dao
+License: BSD 3-Clause License
+Project-URL: Homepage, https://github.com/Dao-AILab/flash-attention
+Project-URL: Repository, https://github.com/Dao-AILab/flash-attention
+Classifier: Development Status :: 3 - Alpha
+Classifier: License :: OSI Approved :: BSD License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.12
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: nvidia-cutlass-dsl==4.3.0.dev0
+Requires-Dist: torch
+Requires-Dist: einops
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: ruff; extra == "dev"
