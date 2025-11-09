@@ -1085,7 +1085,7 @@ class FlashAttentionForwardSm100:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx, _ = work_tile.tile_idx   # split_idx is always 0 for SM100
             seqlen = SeqlenInfoCls(batch_idx)
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
             gQ = cute.local_tile(mQ_cur, cute.select(self.mma_tiler_qk, mode=[0, 2]), (None, 0))
@@ -1250,7 +1250,7 @@ class FlashAttentionForwardSm100:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx, _ = work_tile.tile_idx   # split_idx is always 0 for SM100
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
@@ -1488,7 +1488,7 @@ class FlashAttentionForwardSm100:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx, _ = work_tile.tile_idx   # split_idx is always 0 for SM100 
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
@@ -1799,7 +1799,7 @@ class FlashAttentionForwardSm100:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx, _ = work_tile.tile_idx   # split_idx is always 0 for SM100
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
@@ -2127,7 +2127,7 @@ class FlashAttentionForwardSm100:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx, _ = work_tile.tile_idx   # split_idx is always 0 for SM100
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
