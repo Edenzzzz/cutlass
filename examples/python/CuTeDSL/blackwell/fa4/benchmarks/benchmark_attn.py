@@ -39,6 +39,7 @@ if torch.cuda.get_device_capability()[0] != 9:
 flash_attn_func = None
 
 # Import FMHA kernel
+import warnings
 try:
     import cutlass
     import cutlass.cute as cute
@@ -48,6 +49,7 @@ try:
     from flash_attn.cute.fmha import BlackwellFusedMultiHeadAttentionForward, MaskType
     FMHA_AVAILABLE = True
 except ImportError:
+    warnings.warn("FMHA is not available")
     FMHA_AVAILABLE = False
 
 from triton.testing import do_bench
