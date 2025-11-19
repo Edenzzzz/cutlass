@@ -9,12 +9,17 @@ Project-URL: Repository, https://github.com/Dao-AILab/flash-attention
 Classifier: Development Status :: 3 - Alpha
 Classifier: License :: OSI Approved :: BSD License
 Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
 Classifier: Programming Language :: Python :: 3.12
-Requires-Python: >=3.12
+Requires-Python: >=3.10
 Description-Content-Type: text/markdown
 Requires-Dist: nvidia-cutlass-dsl==4.3.0.dev0
 Requires-Dist: torch
 Requires-Dist: einops
+Requires-Dist: typing_extensions
 Provides-Extra: dev
 Requires-Dist: pytest; extra == "dev"
 Requires-Dist: ruff; extra == "dev"
+
+Requires nvidia-cutlass-dsl==4.2.1

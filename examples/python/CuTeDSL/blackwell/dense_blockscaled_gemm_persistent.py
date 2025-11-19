@@ -300,7 +300,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cute.make_layout((*self.cluster_shape_mn, 1)),
             (tiled_mma_sfb.thr_id.shape,),
         )
-        breakpoint()
         # Compute number of multicast CTAs for A/B
         self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2])
         self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1])

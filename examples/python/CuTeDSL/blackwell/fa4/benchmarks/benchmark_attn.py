@@ -40,13 +40,23 @@ flash_attn_func = None
 
 # Import FMHA kernel
 import warnings
+import sys
+from pathlib import Path
+
+# Add workspace root to path for importing fmha module
+# File is at: examples/python/CuTeDSL/blackwell/fa4/benchmarks/benchmark_attn.py
+# Need to go up 7 levels to reach workspace root
+_workspace_root = Path(__file__).resolve().parent.parent.parent.parent.parent.parent.parent
+if str(_workspace_root) not in sys.path:
+    sys.path.insert(0, str(_workspace_root))
+
 try:
     import cutlass
     import cutlass.cute as cute
     import cutlass.torch as cutlass_torch
     from cutlass.cute.runtime import from_dlpack
     from cutlass.cute.typing import Int32, Float32
-    from flash_attn.cute.fmha import BlackwellFusedMultiHeadAttentionForward, MaskType
+    from examples.python.CuTeDSL.blackwell.fmha import BlackwellFusedMultiHeadAttentionForward, MaskType
     FMHA_AVAILABLE = True
 except ImportError:
     warnings.warn("FMHA is not available")

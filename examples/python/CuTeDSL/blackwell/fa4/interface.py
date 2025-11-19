@@ -446,6 +446,7 @@ def _flash_attn_fwd(
             )
             if sparse_tensors is not None:
                 raise NotImplementedError("BlockSparsity not yet supported on SM 10.0")
+
             fa_fwd = FlashAttentionForwardSm100(
                 head_dim,
                 head_dim_v,

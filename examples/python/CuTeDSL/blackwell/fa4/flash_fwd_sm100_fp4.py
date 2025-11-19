@@ -26,6 +26,7 @@ from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
+import cutlass.utils.blockscaled_layout as blockscaled_utils
 
 import flash_attn.cute.utils as utils
 from flash_attn.cute import copy_utils
@@ -77,6 +78,8 @@ class FlashAttentionForwardSm100:
         is_persistent: bool = True,
         score_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
+        sf_dtype: Optional[Type[cutlass.Numeric]] = None,
+        sf_vec_size: Optional[int] = None,
     ):
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -190,6 +193,10 @@ class FlashAttentionForwardSm100:
         self.num_regs_empty = 24
 
         self.buffer_align_bytes = 1024
+        
+        # Scale factor parameters for block-scaled quantization (FP4)
+        self.sf_dtype = sf_dtype
+        self.sf_vec_size = sf_vec_size
 
     def _setup_attributes(self):
         """Set up configurations and parameters for the FMHA kernel operation.
@@ -240,6 +247,9 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        mSFQ: Optional[cute.Tensor] = None,  # Scale factor for Q
+        mSFK: Optional[cute.Tensor] = None,  # Scale factor for K
+        mSFV: Optional[cute.Tensor] = None,  # Scale factor for V
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -324,19 +334,26 @@ class FlashAttentionForwardSm100:
         # the intermediate tensor p is from tmem & mK-major
         p_source = tcgen05.OperandSource.TMEM
         p_major_mode = tcgen05.OperandMajorMode.K
-        tiled_mma_qk = sm100_utils_basic.make_trivial_tiled_mma(
+        
+        # Always use block-scaled MMA (supports FP16 and FP4)
+        # Default to Float8E8M0FNU and sf_vec_size=32 for FP16 if not provided
+        sf_dtype = self.sf_dtype if self.sf_dtype is not None else cutlass.Float8E8M0FNU
+        sf_vec_size = self.sf_vec_size if self.sf_vec_size is not None else 32
+        tiled_mma_qk = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
             self.q_dtype,
             self.q_major_mode,
             self.k_major_mode,
-            self.qk_acc_dtype,
+            sf_dtype,
+            sf_vec_size,
             cta_group,
             self.mma_tiler_qk[:2],
         )
-        tiled_mma_pv = sm100_utils_basic.make_trivial_tiled_mma(
+        tiled_mma_pv = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
             self.v_dtype,
             p_major_mode,
             self.v_major_mode,
-            self.pv_acc_dtype,
+            sf_dtype,
+            sf_vec_size,
             cta_group,
             self.mma_tiler_pv[:2],
             p_source,
@@ -380,6 +397,27 @@ class FlashAttentionForwardSm100:
             self.epi_tile,
             self.epi_stage,
         )
+        
+        # Create scale factor layouts (always created since we always use block-scaled MMA)
+        sfq_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
+            tiled_mma_qk,
+            self.mma_tiler_qk,
+            sf_vec_size,
+            self.q_stage,
+        )
+        sfk_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(
+            tiled_mma_qk,
+            self.mma_tiler_qk,
+            sf_vec_size,
+            self.kv_stage,
+        )
+        sfv_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(
+            tiled_mma_pv,
+            self.mma_tiler_pv,
+            sf_vec_size,
+            self.kv_stage,
+        )
+        
         if const_expr(not self.same_hdim_kv_padded):
             # sK and sV are using the same physical smem so we need to adjust the stride so that they line up
             stride_sK = const_expr(
@@ -485,7 +523,140 @@ class FlashAttentionForwardSm100:
             tiled_mma_pv,
             self.cluster_layout_vmnk.shape,
         )
-
+        
+        # TMA load for scale factors (only created if scale factor tensors are provided)
+        tma_atom_sfq = None
+        tma_tensor_sfq = None
+        tma_atom_sfk = None
+        tma_tensor_sfk = None
+        tma_atom_sfv = None
+        tma_tensor_sfv = None
+        
+        if const_expr(mSFQ is not None or mSFK is not None or mSFV is not None):
+            # Setup TMA load for SFQ (scale factor for Q, like SFA)
+            if const_expr(mSFQ is not None):
+                sfq_op = sm100_utils_basic.cluster_shape_to_tma_atom_A(
+                    self.cluster_shape_mn, tiled_mma_qk.thr_id
+                )
+                sfq_smem_layout = cute.slice_(sfq_smem_layout_staged, (None, None, None, 0))
+                # Setup scale factor tensor layout
+                sfq_layout = blockscaled_utils.tile_atom_to_shape_SF(mQ.shape, sf_vec_size)
+                mSFQ = cute.make_tensor(mSFQ.iterator, sfq_layout)
+                tma_atom_sfq, tma_tensor_sfq = cute.nvgpu.make_tiled_tma_atom_A(
+                    sfq_op,
+                    mSFQ,
+                    sfq_smem_layout,
+                    self.mma_tiler_qk,
+                    tiled_mma_qk,
+                    self.cluster_layout_vmnk.shape,
+                    internal_type=cutlass.Int16,
+                )
+            
+            # Setup TMA load for SFK (scale factor for K, like SFB)
+            if const_expr(mSFK is not None):
+                sfk_op = sm100_utils_basic.cluster_shape_to_tma_atom_SFB(
+                    self.cluster_shape_mn, tiled_mma_qk.thr_id
+                )
+                sfk_smem_layout = cute.slice_(sfk_smem_layout_staged, (None, None, None, 0))
+                # Setup scale factor tensor layout
+                sfk_layout = blockscaled_utils.tile_atom_to_shape_SF(mK.shape, sf_vec_size)
+                mSFK = cute.make_tensor(mSFK.iterator, sfk_layout)
+                # For SFB, compute mma_inst_shape_mnk_sfb: (M // (2 if use_2cta_instrs else 1), round_up(N, 128), K)
+                mma_inst_bits_k = 256
+                mma_inst_shape_mnk_qk = (
+                    self.mma_tiler_qk[0],
+                    self.mma_tiler_qk[1],
+                    mma_inst_bits_k // self.k_dtype.width,
+                )
+                use_2cta_instrs = self.mma_tiler_qk[0] == 256
+                mma_inst_shape_mnk_sfb_qk = (
+                    mma_inst_shape_mnk_qk[0] // (2 if use_2cta_instrs else 1),
+                    cute.round_up(mma_inst_shape_mnk_qk[1], 128),
+                    mma_inst_shape_mnk_qk[2],
+                )
+                mma_inst_tile_k = 4
+                mma_tiler_sfb_qk = (
+                    mma_inst_shape_mnk_sfb_qk[0],
+                    mma_inst_shape_mnk_sfb_qk[1],
+                    mma_inst_shape_mnk_sfb_qk[2] * mma_inst_tile_k,
+                )
+                # For SFB, we need a separate tiled_mma_sfb with CtaGroup.ONE
+                tiled_mma_sfb_qk = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
+                    self.k_dtype,
+                    self.k_major_mode,
+                    self.k_major_mode,
+                    sf_dtype,
+                    sf_vec_size,
+                    tcgen05.CtaGroup.ONE,
+                    mma_inst_shape_mnk_sfb_qk[:2],
+                )
+                cluster_layout_sfb_vmnk = cute.tiled_divide(
+                    cute.make_layout(self.cluster_shape_mnk),
+                    (tiled_mma_sfb_qk.thr_id.shape,),
+                )
+                tma_atom_sfk, tma_tensor_sfk = cute.nvgpu.make_tiled_tma_atom_B(
+                    sfk_op,
+                    mSFK,
+                    sfk_smem_layout,
+                    mma_tiler_sfb_qk,
+                    tiled_mma_sfb_qk,
+                    cluster_layout_sfb_vmnk.shape,
+                    internal_type=cutlass.Int16,
+                )
+            
+            # Setup TMA load for SFV (scale factor for V, like SFB)
+            if const_expr(mSFV is not None):
+                sfv_op = sm100_utils_basic.cluster_shape_to_tma_atom_SFB(
+                    self.cluster_shape_mn, tiled_mma_pv.thr_id
+                )
+                sfv_smem_layout = cute.slice_(sfv_smem_layout_staged, (None, None, None, 0))
+                # Setup scale factor tensor layout
+                sfv_layout = blockscaled_utils.tile_atom_to_shape_SF(mV.shape, sf_vec_size)
+                mSFV = cute.make_tensor(mSFV.iterator, sfv_layout)
+                # For SFB, compute mma_inst_shape_mnk_sfb: (M // (2 if use_2cta_instrs else 1), round_up(N, 128), K)
+                mma_inst_bits_k = 256
+                mma_inst_shape_mnk_pv = (
+                    self.mma_tiler_pv[0],
+                    self.mma_tiler_pv[1],
+                    mma_inst_bits_k // self.v_dtype.width,
+                )
+                use_2cta_instrs = self.mma_tiler_pv[0] == 256
+                mma_inst_shape_mnk_sfb_pv = (
+                    mma_inst_shape_mnk_pv[0] // (2 if use_2cta_instrs else 1),
+                    cute.round_up(mma_inst_shape_mnk_pv[1], 128),
+                    mma_inst_shape_mnk_pv[2],
+                )
+                mma_inst_tile_k = 4
+                mma_tiler_sfb_pv = (
+                    mma_inst_shape_mnk_sfb_pv[0],
+                    mma_inst_shape_mnk_sfb_pv[1],
+                    mma_inst_shape_mnk_sfb_pv[2] * mma_inst_tile_k,
+                )
+                # For SFB, we need a separate tiled_mma_sfb with CtaGroup.ONE
+                tiled_mma_sfb_pv = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
+                    self.v_dtype,
+                    p_major_mode,
+                    self.v_major_mode,
+                    sf_dtype,
+                    sf_vec_size,
+                    tcgen05.CtaGroup.ONE,
+                    mma_inst_shape_mnk_sfb_pv[:2],
+                    p_source,
+                )
+                cluster_layout_sfb_pv_vmnk = cute.tiled_divide(
+                    cute.make_layout(self.cluster_shape_mnk),
+                    (tiled_mma_sfb_pv.thr_id.shape,),
+                )
+                tma_atom_sfv, tma_tensor_sfv = cute.nvgpu.make_tiled_tma_atom_B(
+                    sfv_op,
+                    mSFV,
+                    sfv_smem_layout,
+                    mma_tiler_sfb_pv,
+                    tiled_mma_sfb_pv,
+                    cluster_layout_sfb_pv_vmnk.shape,
+                    internal_type=cutlass.Int16,
+                )
+            
         o_cta_v_layout = cute.composition(cute.make_identity_layout(mO.shape), self.epi_tile)
 
         # print(sO_layout.outer)
@@ -588,6 +759,11 @@ class FlashAttentionForwardSm100:
             cute.cosize(sQ_layout) if const_expr(not self.overlap_sO_sQ) else
             cutlass.max(cute.cosize(sQ_layout), cute.cosize(sO_layout) * self.o_dtype.width // self.q_dtype.width)
         )
+        
+        # Calculate scale factor shared memory sizes
+        sfq_smem_size = cute.cosize(sfq_smem_layout_staged)
+        sfk_smem_size = cute.cosize(sfk_smem_layout_staged)
+        sfv_smem_size = cute.cosize(sfv_smem_layout_staged)
 
         @cute.struct
         class SharedStorage:
@@ -609,6 +785,19 @@ class FlashAttentionForwardSm100:
             sK: cute.struct.Align[
                 # cute.cosize(sK_layout) is correct even in the case of self.uneven_kv_smem
                 cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
+                self.buffer_align_bytes,
+            ]
+            # Scale factor shared memory (if block-scaled quantization is used)
+            sSFQ: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint8, sfq_smem_size],
+                self.buffer_align_bytes,
+            ]
+            sSFK: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint8, sfk_smem_size],
+                self.buffer_align_bytes,
+            ]
+            sSFV: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint8, sfv_smem_size],
                 self.buffer_align_bytes,
             ]
 
@@ -673,6 +862,15 @@ class FlashAttentionForwardSm100:
             num_splits,
             aux_tensors,
             fastdiv_mods,
+            tma_atom_sfq,
+            tma_tensor_sfq,
+            tma_atom_sfk,
+            tma_tensor_sfk,
+            tma_atom_sfv,
+            tma_tensor_sfv,
+            sfq_smem_layout_staged,
+            sfk_smem_layout_staged,
+            sfv_smem_layout_staged,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -717,6 +915,15 @@ class FlashAttentionForwardSm100:
         num_splits: Int32,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
+        tma_atom_sfq: Optional[cute.CopyAtom] = None,
+        tma_tensor_sfq: Optional[cute.Tensor] = None,
+        tma_atom_sfk: Optional[cute.CopyAtom] = None,
+        tma_tensor_sfk: Optional[cute.Tensor] = None,
+        tma_atom_sfv: Optional[cute.CopyAtom] = None,
+        tma_tensor_sfv: Optional[cute.Tensor] = None,
+        sfq_smem_layout_staged: Optional[cute.ComposedLayout] = None,
+        sfk_smem_layout_staged: Optional[cute.ComposedLayout] = None,
+        sfv_smem_layout_staged: Optional[cute.ComposedLayout] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 

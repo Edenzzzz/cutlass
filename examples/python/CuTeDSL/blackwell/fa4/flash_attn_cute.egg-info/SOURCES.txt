@@ -8,6 +8,7 @@ blackwell_helpers.py
 block_info.py
 block_sparse_utils.py
 block_sparsity.py
+compute_block_sparsity.py
 copy_utils.py
 cute_dsl_utils.py
 fast_math.py
@@ -19,6 +20,7 @@ flash_bwd_sm90.py
 flash_fwd.py
 flash_fwd_combine.py
 flash_fwd_sm100.py
+flash_fwd_sm100_fp4.py
 hopper_helpers.py
 interface.py
 mask.py
@@ -42,6 +44,7 @@ utils.py
 ./block_info.py
 ./block_sparse_utils.py
 ./block_sparsity.py
+./compute_block_sparsity.py
 ./copy_utils.py
 ./cute_dsl_utils.py
 ./fast_math.py
@@ -53,6 +56,7 @@ utils.py
 ./flash_fwd.py
 ./flash_fwd_combine.py
 ./flash_fwd_sm100.py
+./flash_fwd_sm100_fp4.py
 ./hopper_helpers.py
 ./interface.py
 ./mask.py
