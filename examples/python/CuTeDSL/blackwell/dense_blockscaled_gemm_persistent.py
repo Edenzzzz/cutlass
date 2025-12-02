@@ -625,7 +625,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             ]
 
         self.shared_storage = SharedStorage
-
         # Launch the kernel synchronously
         self.kernel(
             tiled_mma,
