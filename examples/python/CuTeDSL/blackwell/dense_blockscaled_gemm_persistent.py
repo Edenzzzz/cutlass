@@ -86,7 +86,11 @@ Input arguments to this example is shown below:
 
 .. code-block:: bash
 
+<<<<<<< HEAD
     python examples/blackwell/dense_blockscaled_gemm_persistent.py             \
+=======
+    python examples/python/CuTeDSL/blackwell/dense_blockscaled_gemm_persistent.py            \
+>>>>>>> 3d31c056 (finish quant qk gmem to smem copy)
       --ab_dtype Float4E2M1FN --sf_dtype Float8E8M0FNU --sf_vec_size 16        \
       --c_dtype Float16                                                        \
       --mma_tiler_mn 256,128 --cluster_shape_mn 2,1                            \
@@ -96,7 +100,11 @@ To collect performance with NCU profiler:
 
 .. code-block:: bash
 
+<<<<<<< HEAD
     ncu python examples/blackwell/dense_blockscaled_gemm_persistent.py         \
+=======
+    ncu python examples/python/CuTeDSL/blackwell/dense_blockscaled_gemm_persistent.py        \
+>>>>>>> 3d31c056 (finish quant qk gmem to smem copy)
       --ab_dtype Float4E2M1FN --sf_dtype Float8E8M0FNU --sf_vec_size 16        \
       --c_dtype Float16                                                        \
       --mma_tiler_mn 256,128 --cluster_shape_mn 2,1                            \
@@ -2389,13 +2397,13 @@ def run(
             ref = ref_device.cpu()
             torch.testing.assert_close(c_ref, ref, atol=tolerance, rtol=1e-02)
     def generate_tensors():
-        a_tensor, _ = cutlass_torch.cute_tensor_like(
+        a_tensor, a_torch = cutlass_torch.cute_tensor_like(
             a_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
         )
-        b_tensor, _ = cutlass_torch.cute_tensor_like(
+        b_tensor, b_torch = cutlass_torch.cute_tensor_like(
             b_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
         )
-        c_tensor, _ = cutlass_torch.cute_tensor_like(
+        c_tensor, c_torch = cutlass_torch.cute_tensor_like(
             c_ref, c_dtype, is_dynamic_layout=True, assumed_align=16
         )
 
@@ -2416,11 +2424,13 @@ def run(
             divisibility=2 if c_dtype == cutlass.Float4E2M1FN else 1,
         )
 
-        _, sfa_tensor, _ = create_scale_factor_tensor(l, m, k, sf_vec_size, sf_dtype)
-        _, sfb_tensor, _ = create_scale_factor_tensor(l, n, k, sf_vec_size, sf_dtype)
+        _, sfa_tensor, sfa_torch = create_scale_factor_tensor(l, m, k, sf_vec_size, sf_dtype)
+        _, sfb_tensor, sfb_torch = create_scale_factor_tensor(l, n, k, sf_vec_size, sf_dtype)
+        
         return cute.testing.JitArguments(
             a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, current_stream
         )
+        # return cute.testing.JitArguments(c_torch, b_torch, sfa_torch, sfb_torch, c_torch, current_stream)
 
     workspace_count = 1
     if use_cold_l2:
@@ -2480,7 +2490,7 @@ if __name__ == "__main__":
         help="Cluster shape (comma-separated)",
     )
     parser.add_argument("--ab_dtype", type=cutlass.dtype, default=cutlass.Float4E2M1FN)
-    parser.add_argument("--sf_dtype", type=cutlass.dtype, default=cutlass.Float8E8M0FNU)
+    parser.add_argument("--sf_dtype", type=cutlass.dtype, default=cutlass.Float8E4M3FN)
     parser.add_argument("--sf_vec_size", type=int, default=16)
     parser.add_argument("--c_dtype", type=cutlass.dtype, default=cutlass.Float16)
     parser.add_argument("--a_major", choices=["k", "m"], type=str, default="k")
@@ -2519,7 +2529,7 @@ if __name__ == "__main__":
     if len(args.cluster_shape_mn) != 2:
         parser.error("--cluster_shape_mn must contain exactly 2 values")
 
-    run(
+    time_ms = run(
         args.mnkl,
         args.ab_dtype,
         args.sf_dtype,
@@ -2537,3 +2547,5 @@ if __name__ == "__main__":
         args.use_cold_l2,
     )
     print("PASS")
+    time_ms /= args.iterations
+    print(f"Execution time: {time_ms:.2f} ms")
