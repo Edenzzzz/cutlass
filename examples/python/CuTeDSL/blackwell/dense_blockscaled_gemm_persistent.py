@@ -2238,7 +2238,6 @@ def run(
         stride_order=(2, 0, 1) if c_major == "n" else (2, 1, 0),
         divisibility=32 if ab_dtype == cutlass.Float4E2M1FN else 16,
     )
-
     # Create scale factor tensor SFA/SFB
     def create_scale_factor_tensor(l, mn, k, sf_vec_size, dtype):
         def ceil_div(a, b):
@@ -2284,8 +2283,8 @@ def run(
                 max_val=1,
             ),
         )
-
         # convert ref f32 tensor to cute f32 tensor
+        # fill cute f32 tensor
         cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
             from_dlpack(ref_f32_torch_tensor_cpu),
             from_dlpack(cute_f32_torch_tensor_cpu),
@@ -2341,7 +2340,9 @@ def run(
     )
 
     # Initialize Stream
-    current_stream = cutlass_torch.default_stream()
+    # current_stream = cutlass_torch.default_stream()
+    current_stream = torch.cuda.current_stream()
+    fake_stream = cute.runtime.make_fake_stream()
 
     # Compile gemm kernel
     compiled_gemm = cute.compile(
@@ -2352,15 +2353,21 @@ def run(
         sfb_tensor,
         c_tensor,
         max_active_clusters,
+<<<<<<< HEAD
         current_stream,
         options=f"--opt-level 2",
+=======
+        fake_stream,
+        options=f"--opt-level 2 --enable-tvm-ffi"
+>>>>>>> b8d70f58 (upd example to use tvm-ffi)
     )
 
     # Compute reference result
     if not skip_ref_check:
         # Execute kernel once for reference checking
         compiled_gemm(
-            a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, current_stream
+            # a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, current_stream
+            a_torch, b_torch, sfa_torch, sfb_torch, c_torch, current_stream
         )
         print("Verifying results...")
         res_a = torch.einsum("mkl,mkl->mkl", a_ref, sfa_ref)
@@ -2396,7 +2403,8 @@ def run(
             cute.testing.convert(ref_f8, ref_tensor)
             ref = ref_device.cpu()
             torch.testing.assert_close(c_ref, ref, atol=tolerance, rtol=1e-02)
-    def generate_tensors():
+
+    def generate_tensors(testing=True):
         a_tensor, a_torch = cutlass_torch.cute_tensor_like(
             a_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
         )
@@ -2427,10 +2435,13 @@ def run(
         _, sfa_tensor, sfa_torch = create_scale_factor_tensor(l, m, k, sf_vec_size, sf_dtype)
         _, sfb_tensor, sfb_torch = create_scale_factor_tensor(l, n, k, sf_vec_size, sf_dtype)
         
-        return cute.testing.JitArguments(
-            a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, current_stream
-        )
-        # return cute.testing.JitArguments(c_torch, b_torch, sfa_torch, sfb_torch, c_torch, current_stream)
+        if testing:
+            return cute.testing.JitArguments(
+                a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, current_stream
+            )
+            # return cute.testing.JitArguments(a_torch, b_torch, sfa_torch, sfb_torch, c_torch, current_stream)
+        else:
+            return a_torch, b_torch, sfa_torch, sfb_torch, c_torch, current_stream
 
     workspace_count = 1
     if use_cold_l2:
@@ -2449,7 +2460,7 @@ def run(
         compiled_gemm,
         workspace_generator=generate_tensors,
         workspace_count=workspace_count,
-        stream=current_stream,
+        # stream=current_stream,
         warmup_iterations=warmup_iterations,
         iterations=iterations,
     )
