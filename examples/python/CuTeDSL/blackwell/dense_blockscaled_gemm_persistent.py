@@ -41,6 +41,7 @@ import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
+from flash_attn.cute.modified_utils.helpers import make_tiled_tma_atom_A, make_tiled_tma_atom_B
 from cutlass.cute.runtime import from_dlpack
 
 """
@@ -506,7 +507,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfa_smem_layout = cute.slice_(
             self.sfa_smem_layout_staged, (None, None, None, 0)
         )
-        tma_atom_sfa, tma_tensor_sfa = cute.nvgpu.make_tiled_tma_atom_A(
+        # breakpoint()
+        # tma_atom_sfa, tma_tensor_sfa = cute.nvgpu.make_tiled_tma_atom_A(
+        tma_atom_sfa, tma_tensor_sfa = make_tiled_tma_atom_A(
             sfa_op,
             sfa_tensor,
             sfa_smem_layout,
