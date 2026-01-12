@@ -341,6 +341,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         )
 
         # Compute A/B/SFA/SFB/C shared memory layout
+        # ((Atom_Inst_M, Atom_Inst_K), MMA_M, MMA_K, STAGE)
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma,
             self.mma_tiler,
@@ -353,6 +354,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.b_dtype,
             self.num_ab_stage,
         )
+        # (((Atom_Inst_M, Rest_M),(Atom_Inst_K, Rest_K)), MMA_M, MMA_K, STAGE)
         self.sfa_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
             tiled_mma,
             self.mma_tiler,
